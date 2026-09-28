@@ -1,0 +1,44 @@
+services:
+  avatar-factory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: avatar-factory:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AVATAR_FACTORY_MAX_UPLOAD_MB: ${AVATAR_FACTORY_MAX_UPLOAD_MB:-100}
+    volumes:
+      - avatar_factory_data:/app/data
+    networks:
+      - avatar-factory-network
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.avatar-factory.rule=Host(`${AVATAR_FACTORY_HOST:?Defina AVATAR_FACTORY_HOST no arquivo .env}`)
+      - traefik.http.routers.avatar-factory.entrypoints=websecure
+      - traefik.http.routers.avatar-factory.tls=true
+      - traefik.http.services.avatar-factory.loadbalancer.server.port=8000
+
+networks:
+  avatar-factory-network:
+    name: avatar-factory-network
+    driver: bridge
+
+volumes:
+  avatar_factory_data:
+    name: avatar_factory_data
