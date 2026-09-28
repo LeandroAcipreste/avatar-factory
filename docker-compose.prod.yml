@@ -32,6 +32,7 @@ services:
       - traefik.http.routers.avatar-factory.rule=Host(`${AVATAR_FACTORY_HOST:?Defina AVATAR_FACTORY_HOST no arquivo .env}`)
       - traefik.http.routers.avatar-factory.entrypoints=websecure
       - traefik.http.routers.avatar-factory.tls=true
+      - traefik.http.routers.avatar-factory.tls.certresolver=letsencrypt
       - traefik.http.services.avatar-factory.loadbalancer.server.port=8000
 
 networks:
