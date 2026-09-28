@@ -3,7 +3,7 @@
 {% block content %}
 <a class="back" href="/">← Voltar</a>
 <section class="hero">
-  <p class="eyebrow">{{ 'AVATAR PREPARADO' if job.status == 'avatar_prepared' else 'JOB ' ~ job.status|upper }}</p>
+  <p class="eyebrow">GPU: {{ job.status|upper }}</p>
   <h1>{{ job.original_filename }}</h1>
   <p>Declaração de consentimento registrada por <strong>{{ job.consent_name }}</strong>: uso de imagem e voz para criação de avatar e conteúdos autorizados pelo cliente.</p>
 </section>
@@ -11,7 +11,8 @@
   <div class="card">
     {% if job.thumbnail_path %}<img class="thumb" src="/media/{{ job.thumbnail_path }}" alt="Thumbnail do vídeo">{% endif %}
     <h2>Relatório visual</h2>
-    <dl><dt>Status</dt><dd>{{ 'Avatar preparado' if job.status == 'avatar_prepared' else job.status }}</dd><dt>Tamanho</dt><dd>{{ (job.file_size / 1024 / 1024)|round(2) }} MB</dd><dt>Duração</dt><dd>{{ '%.1f'|format(job.duration_seconds) if job.duration_seconds else '—' }} s</dd><dt>Resolução</dt><dd>{{ job.width or '—' }} × {{ job.height or '—' }}</dd><dt>Codec</dt><dd>{{ job.codec or '—' }}</dd></dl>
+    <dl><dt>Estado de despacho GPU</dt><dd>{{ job.status }}</dd><dt>Processamento local</dt><dd>{{ job.processing_status or '—' }}</dd><dt>Provider</dt><dd>{{ job.gpu_provider or '—' }}</dd><dt>Tamanho</dt><dd>{{ (job.file_size / 1024 / 1024)|round(2) }} MB</dd><dt>Duração</dt><dd>{{ '%.1f'|format(job.duration_seconds) if job.duration_seconds else '—' }} s</dd><dt>Resolução</dt><dd>{{ job.width or '—' }} × {{ job.height or '—' }}</dd><dt>Codec</dt><dd>{{ job.codec or '—' }}</dd></dl>
+    {% if job.gpu_error_message %}<p class="alert">Despacho GPU: {{ job.gpu_error_message }}</p>{% endif %}
     {% if job.error_message %}<p class="alert">{{ job.error_message }}</p>{% endif %}
   </div>
   <div class="card">
@@ -32,6 +33,7 @@
     <h3>Recomendações de fala</h3><ul>{% for note in audio.recommendations or [] %}<li>{{ note }}</li>{% endfor %}</ul>
   </div>
 </section>
+<section class="card"><h2>Histórico de despacho</h2><ul>{% for event in job.dispatch_history %}<li>{{ event.at }} · {{ event.provider }} · <strong>{{ event.status }}</strong> — {{ event.message }}</li>{% else %}<li class="muted">Nenhuma tentativa registrada.</li>{% endfor %}</ul></section>
 <section class="details"><div class="card"><h2>Recomendações visuais</h2><ul>{% for note in job.recommendations %}<li>{{ note }}</li>{% endfor %}</ul></div><div class="card"><h2>Frames de amostra</h2><div class="frames">{% for frame in job.sample_frames %}<img src="/media/{{ frame }}" alt="Frame de amostra {{ loop.index }}">{% else %}<p class="muted">Nenhum frame extraído.</p>{% endfor %}</div></div></section>
 <p class="notice">O relatório é técnico e informativo: não identifica pessoas, não avalia a semelhança de voz e não realiza clonagem nem geração externa.</p>
 {% endblock %}

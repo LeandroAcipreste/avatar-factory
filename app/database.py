@@ -23,13 +23,21 @@ def init_db() -> None:
                 sample_frames_json TEXT,
                 recommendations_json TEXT,
                 audio_report_json TEXT,
-                consent_declaration TEXT
+                consent_declaration TEXT,
+                processing_status TEXT,
+                gpu_provider TEXT,
+                gpu_error_message TEXT,
+                dispatch_history_json TEXT
             )
         ''')
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         for column, definition in (
             ("audio_report_json", "TEXT"),
             ("consent_declaration", "TEXT"),
+            ("processing_status", "TEXT"),
+            ("gpu_provider", "TEXT"),
+            ("gpu_error_message", "TEXT"),
+            ("dispatch_history_json", "TEXT"),
         ):
             if column not in existing_columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")

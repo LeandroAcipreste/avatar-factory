@@ -10,7 +10,8 @@ MVP em Python para **receber vídeo consentido**, validar sua estrutura, extrair
 - Thumbnail e até 3 frames de amostra via `ffmpeg`.
 - Análise técnica local e opcional de loudness/silêncio via `ffmpeg`, tolerante a falhas.
 - Relatório informativo: tamanho, duração, resolução, codecs, áudio e recomendações. Não identifica pessoas nem mede semelhança de voz.
-- Jobs persistidos em SQLite local (`data/avatar_factory.db`).
+- Jobs persistidos em SQLite local (`data/avatar_factory.db`), com estado e histórico sanitizado de despacho GPU.
+- Adaptador Kaggle opcional: após o upload o job é persistido e o encaminhamento é tentado automaticamente, sem botão manual; por padrão ele fica em `uploaded` e não faz chamadas externas.
 - Interface Jinja2 e API: `GET /api/jobs`, `POST /api/jobs`, `GET /api/jobs/{id}`, `GET /health`; documentação interativa em `/docs`.
 
 ## Pré-requisitos locais
@@ -35,6 +36,16 @@ py -m uvicorn app.main:app --reload
 ```
 
 Acesse `http://127.0.0.1:8000`. Para mudar o limite, defina `AVATAR_FACTORY_MAX_UPLOAD_MB` antes de iniciar, por exemplo: `$env:AVATAR_FACTORY_MAX_UPLOAD_MB=250`.
+
+## Despacho GPU Kaggle (experimental)
+
+O adapter Kaggle é uma integração **experimental e efêmera**, não um worker de produção confiável: sessões, quotas e disponibilidade do Kaggle podem terminar sem aviso. O fluxo padrão mantém `KAGGLE_GPU_ENABLED=false`, portanto testes e uploads locais não acionam rede. Ao habilitar, o job já persistido é encaminhado automaticamente; não há segundo botão nem etapa adicional de consentimento.
+
+Para instalar o cliente oficial somente no ambiente que vai usar o adapter: `py -m pip install kaggle`. Configure, fora do repositório, `KAGGLE_GPU_ENABLED=true`, `KAGGLE_USERNAME`, `KAGGLE_KEY`, `KAGGLE_KERNEL_REF` e `KAGGLE_DATASET_SLUG`. Nunca grave a chave no código, banco ou histórico. Para cada job, o adapter cria `data/kaggle-staging/<job>/dataset` e `kernel`, copia o vídeo para o dataset, gera `dataset-metadata.json`, `kernel-metadata.json` (GPU habilitada) e um `kernel.py`. Pelo SDK oficial, ele verifica o dataset, cria-o ou envia uma nova versão e então faz `kernels_push` do bundle isolado.
+
+`gpu_queued` significa somente que o cliente Kaggle aceitou a operação de dataset e o push do kernel — **não** que o kernel terminou nem que produziu mídia. O script gerado grava apenas um manifesto em `/kaggle/working/dispatch_result.json`; um worker de produção deve substituir esse contrato por processamento e coleta de outputs confiáveis. Se a verificação do dataset não retornar um 404 inequívoco, a operação falha em `gpu_dispatch_failed` em vez de tentar uma criação não verificada. Os estados são `uploaded` (desativado/aguardando), `gpu_queued` (push aceito) e `gpu_dispatch_failed` (falha segura, com mensagem sanitizada); a análise local fica em `processing_status`.
+
+Para produção, implemente outro provider em `app/gpu_dispatch.py` (fila/worker durável, observabilidade e retenção) preservando a mesma interface de dispatcher e sem alterar a declaração única de consentimento.
 
 ## Deploy em VPS Ubuntu com Traefik
 
@@ -111,4 +122,4 @@ docker-compose.prod.yml   serviço de produção, volume e labels Traefik
 
 ## Privacidade e próximos passos
 
-A mídia e os derivados permanecem no volume persistente local. Um job recebe o status **Avatar preparado** somente quando imagem e áudio atendem aos critérios técnicos básicos (vídeo com pelo menos 10 s e 720p; áudio detectado com qualidade técnica adequada). O relatório é informativo, não uma avaliação de identidade ou de qualidade artística. Antes de integrar qualquer provedor externo, implemente autenticação, política de retenção/exclusão, trilha de auditoria e o conector autorizado.
+A mídia e os derivados permanecem no volume persistente local. A aptidão da análise local aparece em `processing_status` como **avatar_prepared** quando imagem e áudio atendem aos critérios técnicos básicos (vídeo com pelo menos 10 s e 720p; áudio detectado com qualidade técnica adequada). O relatório é informativo, não uma avaliação de identidade ou de qualidade artística. O provider Kaggle, se habilitado, é experimental e não substitui um worker de produção com retenção, auditoria e disponibilidade controladas.

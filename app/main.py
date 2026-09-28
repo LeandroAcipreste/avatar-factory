@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from .config import ALLOWED_EXTENSIONS, BASE_DIR, MAX_UPLOAD_BYTES, UPLOAD_DIR
 from .audio import analyze_audio
 from .database import create_job, get_job, init_db, list_jobs, update_job
+from .gpu_dispatch import KaggleGpuDispatcher, dispatch_history_entry
 from .media import MediaValidationError, extract_images, probe_video
 from .quality import recommendations
 
@@ -32,6 +33,7 @@ def serialize(row):
     item["sample_frames"] = json.loads(item.pop("sample_frames_json") or "[]")
     item["recommendations"] = json.loads(item.pop("recommendations_json") or "[]")
     item["audio_report"] = json.loads(item.pop("audio_report_json", None) or "{}")
+    item["dispatch_history"] = json.loads(item.pop("dispatch_history_json", None) or "[]")
     return item
 
 @app.get("/", include_in_schema=False)
@@ -78,10 +80,24 @@ async def save_and_process(video: UploadFile, consent_name: str, consent: str | 
                 output.write(chunk)
         job_data = {"id": job_id, "original_filename": Path(video.filename).name, "stored_filename": stored_filename,
                     "consent_name": consent_name.strip(), "created_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "processing", "error_message": None, "file_size": written,
+                    "status": "uploaded", "processing_status": "processing", "error_message": None, "file_size": written,
+                    "gpu_provider": "kaggle", "gpu_error_message": None, "dispatch_history_json": "[]",
                     "consent_declaration": "Autorizo o uso da imagem e voz desta pessoa para criar avatar e conteúdos autorizados pelo cliente neste fluxo local."}
         create_job(job_data)
         job_persisted = True
+        # Persist first so every forwarding attempt is auditable, then dispatch
+        # automatically.  The dispatcher is disabled by default and never asks
+        # for a second consent declaration.
+        dispatch_input = {**job_data, "upload_path": str(destination)}
+        dispatch_result = KaggleGpuDispatcher().dispatch(dispatch_input)
+        history = [dispatch_history_entry(dispatch_result)]
+        update_job(
+            job_id,
+            status=dispatch_result.status,
+            gpu_provider=dispatch_result.provider,
+            gpu_error_message=dispatch_result.message if dispatch_result.status == "gpu_dispatch_failed" else None,
+            dispatch_history_json=json.dumps(history, ensure_ascii=False),
+        )
         info = probe_video(destination)
         notes = recommendations(info["duration"], info["width"], info["height"], written)
         audio_report = analyze_audio(destination)
@@ -92,13 +108,13 @@ async def save_and_process(video: UploadFile, consent_name: str, consent: str | 
             notes.append("Não foi possível extrair imagens de amostra; a análise básica foi concluída.")
         visual_passes = info["duration"] >= 10 and min(info["width"], info["height"]) >= 720
         audio_passes = audio_report["status"] == "detected" and audio_report["quality"] == "adequada"
-        status = "avatar_prepared" if visual_passes and audio_passes else "ready"
-        update_job(job_id, status=status, duration_seconds=info["duration"], width=info["width"], height=info["height"], codec=info["codec"], thumbnail_path=thumbnail, sample_frames_json=json.dumps(frames), recommendations_json=json.dumps(notes, ensure_ascii=False), audio_report_json=json.dumps(audio_report, ensure_ascii=False))
+        processing_status = "avatar_prepared" if visual_passes and audio_passes else "ready"
+        update_job(job_id, processing_status=processing_status, duration_seconds=info["duration"], width=info["width"], height=info["height"], codec=info["codec"], thumbnail_path=thumbnail, sample_frames_json=json.dumps(frames), recommendations_json=json.dumps(notes, ensure_ascii=False), audio_report_json=json.dumps(audio_report, ensure_ascii=False))
         return serialize(get_job(job_id))
     except MediaValidationError as exc:
         destination.unlink(missing_ok=True)
         if job_persisted:
-            update_job(job_id, status="failed", error_message=str(exc), recommendations_json=json.dumps([str(exc)], ensure_ascii=False))
+            update_job(job_id, processing_status="failed", error_message=str(exc), recommendations_json=json.dumps([str(exc)], ensure_ascii=False))
         raise
     finally:
         await video.close()

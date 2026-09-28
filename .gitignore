@@ -5,6 +5,7 @@ __pycache__/
 data/*.db
 data/uploads/
 data/derived/
+data/kaggle-staging/
 .env
 # Referência local externa; não faz parte do produto.
 exemplo/
