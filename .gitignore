@@ -8,3 +8,10 @@ data/derived/
 .env
 # Referência local externa; não faz parte do produto.
 exemplo/
+
+# Artefatos efêmeros do experimento de GPU/Kaggle (referências e áudios sintetizados).
+gpu/outputs/
+gpu/*.wav
+gpu/*.mp4
+gpu/*.mov
+gpu/*.webm

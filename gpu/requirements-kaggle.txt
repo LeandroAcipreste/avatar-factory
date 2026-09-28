@@ -1,0 +1,4 @@
+# Ambiente Kaggle (Python 3.10 recomendado). O Kaggle já fornece PyTorch/CUDA.
+# Não instale torch novamente, para preservar a build CUDA da imagem Kaggle.
+TTS==0.22.0
+soundfile>=0.12,<0.14
