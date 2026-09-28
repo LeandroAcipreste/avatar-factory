@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import ALLOWED_EXTENSIONS, BASE_DIR, MAX_UPLOAD_BYTES, UPLOAD_DIR
+from .audio import analyze_audio
 from .database import create_job, get_job, init_db, list_jobs, update_job
 from .media import MediaValidationError, extract_images, probe_video
 from .quality import recommendations
@@ -30,6 +31,7 @@ def serialize(row):
     item = dict(row)
     item["sample_frames"] = json.loads(item.pop("sample_frames_json") or "[]")
     item["recommendations"] = json.loads(item.pop("recommendations_json") or "[]")
+    item["audio_report"] = json.loads(item.pop("audio_report_json", None) or "{}")
     return item
 
 @app.get("/", include_in_schema=False)
@@ -58,7 +60,7 @@ async def create_job_api(
 
 async def save_and_process(video: UploadFile, consent_name: str, consent: str | None):
     if consent != "on" or not consent_name.strip():
-        raise MediaValidationError("Informe seu nome e confirme o consentimento de uso de imagem.")
+        raise MediaValidationError("Informe seu nome e confirme a declaração de consentimento para imagem e voz.")
     suffix = Path(video.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise MediaValidationError("Envie apenas arquivos MP4, MOV ou WebM.")
@@ -76,17 +78,22 @@ async def save_and_process(video: UploadFile, consent_name: str, consent: str | 
                 output.write(chunk)
         job_data = {"id": job_id, "original_filename": Path(video.filename).name, "stored_filename": stored_filename,
                     "consent_name": consent_name.strip(), "created_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "processing", "error_message": None, "file_size": written}
+                    "status": "processing", "error_message": None, "file_size": written,
+                    "consent_declaration": "Autorizo o uso da imagem e voz desta pessoa para criar avatar e conteúdos autorizados pelo cliente neste fluxo local."}
         create_job(job_data)
         job_persisted = True
         info = probe_video(destination)
         notes = recommendations(info["duration"], info["width"], info["height"], written)
+        audio_report = analyze_audio(destination)
         try:
             thumbnail, frames = extract_images(destination, job_id, info["duration"])
         except MediaValidationError:
             thumbnail, frames = None, []
             notes.append("Não foi possível extrair imagens de amostra; a análise básica foi concluída.")
-        update_job(job_id, status="ready", duration_seconds=info["duration"], width=info["width"], height=info["height"], codec=info["codec"], thumbnail_path=thumbnail, sample_frames_json=json.dumps(frames), recommendations_json=json.dumps(notes, ensure_ascii=False))
+        visual_passes = info["duration"] >= 10 and min(info["width"], info["height"]) >= 720
+        audio_passes = audio_report["status"] == "detected" and audio_report["quality"] == "adequada"
+        status = "avatar_prepared" if visual_passes and audio_passes else "ready"
+        update_job(job_id, status=status, duration_seconds=info["duration"], width=info["width"], height=info["height"], codec=info["codec"], thumbnail_path=thumbnail, sample_frames_json=json.dumps(frames), recommendations_json=json.dumps(notes, ensure_ascii=False), audio_report_json=json.dumps(audio_report, ensure_ascii=False))
         return serialize(get_job(job_id))
     except MediaValidationError as exc:
         destination.unlink(missing_ok=True)

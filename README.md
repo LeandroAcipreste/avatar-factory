@@ -1,14 +1,15 @@
 # Avatar Factory
 
-MVP em Python para **receber vídeo consentido**, validar sua estrutura, extrair referências visuais e gerar um relatório básico de qualidade. Ele **não gera avatares, não treina modelos e não envia mídia para serviços externos**. Geração/treino é um conector futuro que deve ser autorizado explicitamente.
+MVP em Python para **receber vídeo consentido**, validar sua estrutura, extrair referências visuais e gerar relatórios técnicos de imagem e áudio. Ele **não clona voz, não gera mídia e não envia arquivos para serviços externos**. A declaração única de consentimento cobre imagem e voz para criação de avatar e conteúdos autorizados pelo cliente; qualquer conector externo futuro deverá ser autorizado e implementado separadamente.
 
 ## Recursos
 
 - Upload de MP4, MOV e WebM com limite configurável (padrão: 100 MB).
-- Nome e checkbox obrigatórios para registrar consentimento.
-- Validação real via `ffprobe` no PATH.
+- Nome e declaração única obrigatória para registrar consentimento de imagem e voz.
+- Validação real via `ffprobe` no PATH, inclusive stream de áudio, codec, duração, sample rate, canais e bitrate quando disponível.
 - Thumbnail e até 3 frames de amostra via `ffmpeg`.
-- Relatório: tamanho, duração, resolução, codec e recomendações.
+- Análise técnica local e opcional de loudness/silêncio via `ffmpeg`, tolerante a falhas.
+- Relatório informativo: tamanho, duração, resolução, codecs, áudio e recomendações. Não identifica pessoas nem mede semelhança de voz.
 - Jobs persistidos em SQLite local (`data/avatar_factory.db`).
 - Interface Jinja2 e API: `GET /api/jobs`, `POST /api/jobs`, `GET /api/jobs/{id}`, `GET /health`; documentação interativa em `/docs`.
 
@@ -110,4 +111,4 @@ docker-compose.prod.yml   serviço de produção, volume e labels Traefik
 
 ## Privacidade e próximos passos
 
-A mídia e os derivados permanecem no volume persistente local. Antes de integrar qualquer provedor de avatar, implemente autenticação, política de retenção/exclusão, trilha de auditoria e uma confirmação específica para o envio ao provedor autorizado.
+A mídia e os derivados permanecem no volume persistente local. Um job recebe o status **Avatar preparado** somente quando imagem e áudio atendem aos critérios técnicos básicos (vídeo com pelo menos 10 s e 720p; áudio detectado com qualidade técnica adequada). O relatório é informativo, não uma avaliação de identidade ou de qualidade artística. Antes de integrar qualquer provedor externo, implemente autenticação, política de retenção/exclusão, trilha de auditoria e o conector autorizado.
