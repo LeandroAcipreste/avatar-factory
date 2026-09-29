@@ -7,6 +7,16 @@
   <h1>{{ job.original_filename }}</h1>
   <p>Declaração de consentimento registrada por <strong>{{ job.consent_name }}</strong>: uso de imagem e voz para criação de avatar e conteúdos autorizados pelo cliente.</p>
 </section>
+<section class="card">
+  <h2>Fala em português brasileiro</h2>
+  <p>{{ job.speech_text or 'Nenhum texto de fala informado.' }}</p>
+  {% if job.wav_available %}
+  <audio controls preload="none" src="/jobs/{{ job.id }}/audio.wav"></audio>
+  <p><a href="/jobs/{{ job.id }}/audio.wav" download>Baixar áudio WAV</a></p>
+  {% else %}<p class="muted">Nenhum WAV disponível localmente. Envio aceito ou execução iniciada não significa síntese concluída.</p>{% endif %}
+  {% if job.gpu_result %}<p>Estado informado pelo worker: {{ job.gpu_result.state or job.gpu_result.status or 'resultado recebido' }}</p>{% endif %}
+  <p class="notice">O áudio gerado, quando disponível, não comprova identidade nem garante semelhança com a voz de referência.</p>
+</section>
 <section class="details">
   <div class="card">
     {% if job.thumbnail_path %}<img class="thumb" src="/media/{{ job.thumbnail_path }}" alt="Thumbnail do vídeo">{% endif %}
@@ -35,5 +45,5 @@
 </section>
 <section class="card"><h2>Histórico de despacho</h2><ul>{% for event in job.dispatch_history %}<li>{{ event.at }} · {{ event.provider }} · <strong>{{ event.status }}</strong> — {{ event.message }}</li>{% else %}<li class="muted">Nenhuma tentativa registrada.</li>{% endfor %}</ul></section>
 <section class="details"><div class="card"><h2>Recomendações visuais</h2><ul>{% for note in job.recommendations %}<li>{{ note }}</li>{% endfor %}</ul></div><div class="card"><h2>Frames de amostra</h2><div class="frames">{% for frame in job.sample_frames %}<img src="/media/{{ frame }}" alt="Frame de amostra {{ loop.index }}">{% else %}<p class="muted">Nenhum frame extraído.</p>{% endfor %}</div></div></section>
-<p class="notice">O relatório é técnico e informativo: não identifica pessoas, não avalia a semelhança de voz e não realiza clonagem nem geração externa.</p>
+<p class="notice">O relatório é técnico e informativo: não identifica pessoas nem avalia a semelhança de voz. A geração externa só ocorre quando o encaminhamento GPU está habilitado.</p>
 {% endblock %}

@@ -1,22 +1,26 @@
-"""Optional GPU-dispatch providers.
+"""Private, isolated Kaggle voice jobs via the official CLI.
 
-Providers are isolated from the upload route so a durable queue/worker provider can
-replace Kaggle without changing consent or media-validation flow. Kaggle is disabled
-by default and its CLI is called only when dispatch is explicitly enabled.
+CLI arguments/output checked against Kaggle/kaggle-api cli.py and
+kaggle_api_extended.py. collect() performs exactly one status request, never waits.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+import uuid
+import wave
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import DATA_DIR
+from .kaggle_worker import DEFAULT_TEXT
 
 
 @dataclass(frozen=True)
@@ -29,13 +33,9 @@ class KaggleGpuSettings:
 
     @classmethod
     def from_env(cls) -> "KaggleGpuSettings":
-        return cls(
-            enabled=os.getenv("KAGGLE_GPU_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
-            username=os.getenv("KAGGLE_USERNAME") or None,
-            api_token=os.getenv("KAGGLE_API_TOKEN") or None,
-            kernel_ref=os.getenv("KAGGLE_KERNEL_REF") or None,
-            dataset_slug=os.getenv("KAGGLE_DATASET_SLUG") or None,
-        )
+        return cls(os.getenv("KAGGLE_GPU_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
+                   os.getenv("KAGGLE_USERNAME") or None, os.getenv("KAGGLE_API_TOKEN") or None,
+                   os.getenv("KAGGLE_KERNEL_REF") or None, os.getenv("KAGGLE_DATASET_SLUG") or None)
 
 
 @dataclass(frozen=True)
@@ -43,150 +43,189 @@ class DispatchResult:
     status: str
     provider: str
     message: str
+    kernel_ref: str | None = None
+    dataset_ref: str | None = None
+    output_path: str | None = None
+    manifest: dict[str, Any] | None = None
 
 
 CommandExecutor = Callable[[list[str], dict[str, str], Path], subprocess.CompletedProcess[str]]
 
 
 def sanitize_dispatch_error(error: Exception | str) -> str:
-    """Return an operator-safe message without tokens, paths, or API responses."""
-    text = str(error).replace("\n", " ").replace("\r", " ")
-    text = re.sub(r"(?i)(key|token|password|secret)\s*[=:]\s*[^\s,;]+", r"\1=[redacted]", text)
-    text = re.sub(r"(?i)(kaggle_api_token|kaggle_username)\s*[^\s,;]*", "[redacted]", text)
-    return text[:240] or "Falha desconhecida ao encaminhar para o worker GPU."
+    """Never expose arbitrary remote errors (which may contain secrets or paths)."""
+    return "Falha na operação Kaggle; verifique configuração, conectividade e disponibilidade da GPU."
 
 
 class KaggleGpuDispatcher:
-    """Create a per-job Kaggle dataset version and push a GPU kernel CLI bundle.
-
-    A `gpu_queued` result means the official Kaggle CLI accepted the input dataset
-    operation and kernel push. It does *not* claim the ephemeral Kaggle run finished
-    or that an output file was produced.
-    """
-
     provider_name = "kaggle"
 
-    def __init__(
-        self,
-        settings: KaggleGpuSettings | None = None,
-        executor: CommandExecutor | None = None,
-        staging_root: Path | None = None,
-    ):
+    def __init__(self, settings: KaggleGpuSettings | None = None, executor: CommandExecutor | None = None,
+                 staging_root: Path | None = None, output_root: Path | None = None):
         self.settings = settings or KaggleGpuSettings.from_env()
         self._executor = executor or self._run_cli
         self.staging_root = staging_root or DATA_DIR / "kaggle-staging"
+        self.output_root = output_root or DATA_DIR / "outputs"
+
+    @staticmethod
+    def _job_id(job: dict[str, Any]) -> str:
+        value = str(job["id"])
+        if not re.fullmatch(r"[a-zA-Z0-9-]{1,80}", value):
+            raise ValueError("Invalid job identifier")
+        return value
+
+    def _configured(self) -> bool:
+        return bool(re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", self.settings.username or "") and
+                    self.settings.api_token and self.settings.api_token != "***" and
+                    not self.settings.api_token.startswith("oc-sent-"))
 
     def dispatch(self, job: dict[str, Any]) -> DispatchResult:
         if not self.settings.enabled:
             return DispatchResult("uploaded", self.provider_name, "Encaminhamento GPU desativado por configuração.")
-        missing = [name for name, value in {
-            "KAGGLE_USERNAME": self.settings.username,
-            "KAGGLE_API_TOKEN": self.settings.api_token,
-            "KAGGLE_KERNEL_REF": self.settings.kernel_ref,
-            "KAGGLE_DATASET_SLUG": self.settings.dataset_slug,
-        }.items() if not value]
-        if missing:
+        if not self._configured():
             return DispatchResult("gpu_dispatch_failed", self.provider_name, "Configuração Kaggle incompleta.")
         try:
             bundle = self._build_bundle(job)
-            env = self._cli_env(Path(bundle["root"]))
-            self._forward(bundle, env)
-            return DispatchResult("gpu_queued", self.provider_name, "Dataset versionado e kernel GPU enviados ao Kaggle; execução pendente.")
-        except Exception as exc:  # CLI/remote failures are expected at this boundary
-            return DispatchResult("gpu_dispatch_failed", self.provider_name, sanitize_dispatch_error(exc))
+            self._forward(bundle, self._cli_env(Path(bundle["root"])))
+            receipt = {key: str(bundle[key]) for key in ("kernel_ref", "dataset_ref")}
+            receipt["job_id"] = self._job_id(job)
+            self._write_json(Path(bundle["root"]).parent / "dispatch.json", receipt)
+            return DispatchResult("gpu_queued", self.provider_name, "Job privado enviado; síntese de voz pendente.",
+                                  receipt["kernel_ref"], receipt["dataset_ref"])
+        except Exception:
+            return DispatchResult("gpu_dispatch_failed", self.provider_name, sanitize_dispatch_error(""))
 
     def _build_bundle(self, job: dict[str, Any]) -> dict[str, Path | str]:
-        source_video = Path(job["upload_path"])
-        if not source_video.is_file():
-            raise RuntimeError("Arquivo de upload não está disponível para o adaptador Kaggle.")
-        job_id = str(job["id"])
-        if not re.fullmatch(r"[a-zA-Z0-9-]{1,80}", job_id):
-            raise RuntimeError("Identificador de job inválido para staging Kaggle.")
-        dataset_ref = f"{self.settings.username}/{self.settings.dataset_slug}"
-        root = self.staging_root / job_id
+        job_id = self._job_id(job)
+        source = Path(job["upload_path"])
+        text = str(job.get("synthesis_text") or DEFAULT_TEXT).strip()
+        if not source.is_file() or source.suffix.lower() not in {".mp4", ".mov", ".webm"}:
+            raise ValueError("Invalid upload")
+        if not text or len(text) > 1000:
+            raise ValueError("Synthesis text must contain 1-1000 characters")
+        # Never version a shared dataset or overwrite a running job's kernel.
+        unique = uuid.uuid4().hex
+        dataset_slug = f"avatar-input-{unique}"
+        kernel_slug = f"avatar-voice-{unique}"
+        dataset_ref = f"{self.settings.username}/{dataset_slug}"
+        kernel_ref = f"{self.settings.username}/{kernel_slug}"
+        root = self.staging_root / job_id / unique
         dataset_dir, kernel_dir = root / "dataset", root / "kernel"
-        if root.exists():
-            shutil.rmtree(root)
         dataset_dir.mkdir(parents=True)
-        kernel_dir.mkdir(parents=True)
-        video_name = f"reference{source_video.suffix.lower()}"
-        shutil.copy2(source_video, dataset_dir / video_name)
-        self._write_json(dataset_dir / "dataset-metadata.json", {
-            "title": f"Avatar Factory job {job_id}", "id": dataset_ref,
-            "licenses": [{"name": "other"}],
-        })
+        kernel_dir.mkdir()
+        video_name = "reference" + source.suffix.lower()
+        shutil.copy2(source, dataset_dir / video_name)
+        self._write_json(dataset_dir / "job.json", {"job_id": job_id, "video_name": video_name, "text": text, "language": "pt"})
+        self._write_json(dataset_dir / "dataset-metadata.json", {"title": dataset_slug, "id": dataset_ref,
+                                                                 "licenses": [{"name": "other"}], "isPrivate": True})
         self._write_json(kernel_dir / "kernel-metadata.json", {
-            "id": self.settings.kernel_ref, "title": f"Avatar Factory GPU job {job_id}",
-            "code_file": "kernel.py", "language": "python", "kernel_type": "script",
-            "is_private": True, "enable_gpu": True, "dataset_sources": [dataset_ref],
-        })
-        (kernel_dir / "kernel.py").write_text(self._kernel_script(dataset_ref, job_id), encoding="utf-8")
-        return {"root": root, "dataset_dir": dataset_dir, "kernel_dir": kernel_dir, "dataset_ref": dataset_ref}
+            "id": kernel_ref, "title": kernel_slug, "code_file": "kernel.py", "language": "python",
+            "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True,
+            "dataset_sources": [dataset_ref]})
+        shutil.copy2(Path(__file__).with_name("kaggle_worker.py"), kernel_dir / "kernel.py")
+        return {"root": root, "dataset_dir": dataset_dir, "kernel_dir": kernel_dir,
+                "dataset_ref": dataset_ref, "kernel_ref": kernel_ref}
 
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    @staticmethod
-    def _kernel_script(dataset_ref: str, job_id: str) -> str:
-        return f'''"""Generated Avatar Factory Kaggle worker contract."""
-import json
-from pathlib import Path
-
-DATASET_REF = {dataset_ref!r}
-JOB_ID = {job_id!r}
-input_dir = Path("/kaggle/input") / DATASET_REF.split("/", 1)[-1]
-videos = [str(path) for path in input_dir.glob("reference.*")]
-output = Path("/kaggle/working/dispatch_result.json")
-output.write_text(json.dumps({{"job_id": JOB_ID, "dataset": DATASET_REF, "input_videos": videos, "state": "worker_started"}}), encoding="utf-8")
-print(output.read_text(encoding="utf-8"))
-'''
-
     def _cli_env(self, root: Path) -> dict[str, str]:
-        """Minimal inheritable environment; token is process-only, never written."""
-        config_dir = root / "kaggle-config"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        env = {name: os.environ[name] for name in ("PATH", "SystemRoot", "WINDIR", "HOME", "USERPROFILE") if os.environ.get(name)}
-        env["KAGGLE_API_TOKEN"] = self.settings.api_token or ""
-        env["KAGGLE_CONFIG_DIR"] = str(config_dir)
+        config = root / "kaggle-config"
+        config.mkdir(parents=True, exist_ok=True)
+        env = {name: os.environ[name] for name in ("PATH", "SystemRoot", "WINDIR", "HOME", "USERPROFILE", "TEMP", "TMP") if os.environ.get(name)}
+        env.update(KAGGLE_API_TOKEN=self.settings.api_token or "", KAGGLE_CONFIG_DIR=str(config))
         return env
 
     def _forward(self, bundle: dict[str, Path | str], env: dict[str, str]) -> None:
-        dataset_dir, kernel_dir = Path(bundle["dataset_dir"]), Path(bundle["kernel_dir"])
-        dataset_ref = str(bundle["dataset_ref"])
-        view = self._execute(["kaggle", "datasets", "view", "-d", dataset_ref], env, dataset_dir)
-        if view.returncode == 0:
-            self._require_success(self._execute(
-                ["kaggle", "datasets", "version", "-p", str(dataset_dir), "-m", "Avatar Factory job input"], env, dataset_dir
-            ), "versionar dataset Kaggle")
-        elif self._is_unambiguous_not_found(view):
-            self._require_success(self._execute(
-                ["kaggle", "datasets", "create", "-p", str(dataset_dir), "--private"], env, dataset_dir
-            ), "criar dataset Kaggle")
-        else:
-            raise RuntimeError("Não foi possível verificar o dataset Kaggle; criação não será tentada.")
-        self._require_success(self._execute(["kaggle", "kernels", "push", "-p", str(kernel_dir)], env, kernel_dir), "enviar kernel Kaggle")
+        dataset, kernel = Path(bundle["dataset_dir"]), Path(bundle["kernel_dir"])
+        # Official CLI creates datasets PRIVATE unless --public is provided.
+        create = self._execute(["kaggle", "datasets", "create", "-p", str(dataset)], env, dataset)
+        self._require_success(create, "create")
+        if re.search(r"\b(error|failed|forbidden)\b", create.stdout + create.stderr, re.I):
+            raise RuntimeError("Dataset create failed")
+        push = self._execute(["kaggle", "kernels", "push", "-p", str(kernel)], env, kernel)
+        self._require_success(push, "push")
+        # CLI can return zero even when ApiSaveKernelResponse.error is populated.
+        if (not re.search(r"Kernel version(?: \d+)? successfully pushed", push.stdout, re.I)
+                or str(bundle["kernel_ref"]) not in push.stdout
+                or re.search(r"push error|not valid dataset sources", push.stdout + push.stderr, re.I)):
+            raise RuntimeError("Kernel push not confirmed")
+
+    def collect(self, job: dict[str, Any]) -> DispatchResult:
+        """One status poll. Read saved receipt; return local WAV only after validation.
+
+        status: gpu_queued/gpu_running/voice_ready/gpu_failed/gpu_collect_failed.
+        No dispatch, upload, scheduler, retry loop or DB mutations are performed.
+        """
+        if not self.settings.enabled or not self._configured():
+            return DispatchResult("gpu_collect_failed", self.provider_name, "Coleta Kaggle desativada ou configuração incompleta.")
+        try:
+            job_id = self._job_id(job)
+            root = self.staging_root / job_id
+            receipt = json.loads((root / "dispatch.json").read_text(encoding="utf-8"))
+            ref = receipt["kernel_ref"]
+            if receipt["job_id"] != job_id or not re.fullmatch(re.escape(self.settings.username or "") + r"/avatar-voice-[a-f0-9]{32}", ref):
+                raise ValueError("Invalid receipt")
+            env = self._cli_env(root)
+            status = self._execute(["kaggle", "kernels", "status", ref], env, root)
+            self._require_success(status, "status")
+            match = re.search(r'has status "(?:KernelWorkerStatus\.)?([a-zA-Z]+)"', status.stdout)
+            if not match:
+                raise RuntimeError("Unknown status")
+            state = match.group(1).lower()
+            if state in {"queued", "running"}:
+                return DispatchResult("gpu_" + state, self.provider_name, "Execução GPU ainda pendente.", ref, receipt["dataset_ref"])
+            if state not in {"complete", "completed", "error", "failed", "cancelled", "canceled"}:
+                raise RuntimeError("Unknown state")
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="collect-", dir=self.output_root) as temp:
+                download = Path(temp)
+                result = self._execute(["kaggle", "kernels", "output", ref, "-p", str(download),
+                                        "--file-pattern", r"^(dispatch_result\.json|voice\.wav)$"], env, root)
+                self._require_success(result, "output")
+                manifest = json.loads((download / "dispatch_result.json").read_text(encoding="utf-8"))
+                if manifest.get("job_id") != job_id:
+                    raise ValueError("Mismatched output job")
+                if state not in {"complete", "completed"} or manifest.get("state") != "completed":
+                    return DispatchResult("gpu_failed", self.provider_name, "Worker GPU não concluiu a síntese.", ref, receipt["dataset_ref"])
+                wav = download / "voice.wav"
+                artifacts = manifest.get("artifacts", [])
+                artifact = next(item for item in artifacts if item.get("name") == "voice.wav")
+                if wav.is_symlink() or not wav.is_file() or wav.stat().st_size != artifact["bytes"]:
+                    raise ValueError("Invalid output size")
+                if hashlib.sha256(wav.read_bytes()).hexdigest() != artifact["sha256"]:
+                    raise ValueError("Invalid output hash")
+                with wave.open(str(wav), "rb") as audio:
+                    if audio.getnframes() <= 0 or audio.getframerate() <= 0:
+                        raise ValueError("Empty WAV")
+                destination = self.output_root / job_id
+                destination.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(wav, destination / "voice.wav")
+                self._write_json(destination / "dispatch_result.json", manifest)
+            return DispatchResult("voice_ready", self.provider_name, "Áudio sintetizado recuperado; vídeo de avatar não foi gerado.",
+                                  ref, receipt["dataset_ref"], str(destination / "voice.wav"), manifest)
+        except Exception:
+            return DispatchResult("gpu_collect_failed", self.provider_name, sanitize_dispatch_error(""))
 
     def _execute(self, command: list[str], env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
         return self._executor(command, env, cwd)
 
     @staticmethod
     def _run_cli(command: list[str], env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False)
-        except FileNotFoundError as exc:
-            raise RuntimeError("Kaggle CLI não instalado ou ausente do PATH.") from exc
-
-    @staticmethod
-    def _is_unambiguous_not_found(result: subprocess.CompletedProcess[str]) -> bool:
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        return bool(re.search(r"\b404\b|dataset[^\n]*not found|not found[^\n]*dataset", output))
+        return subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=False, timeout=600)
 
     @staticmethod
     def _require_success(result: subprocess.CompletedProcess[str], action: str) -> None:
         if result.returncode != 0:
-            raise RuntimeError(f"Falha ao {action} (Kaggle CLI retornou código {result.returncode}).")
+            raise RuntimeError("Kaggle operation failed: " + action)
 
 
 def dispatch_history_entry(result: DispatchResult) -> dict[str, str]:
-    return {"at": datetime.now(timezone.utc).isoformat(), "provider": result.provider, "status": result.status, "message": result.message}
+    entry = {"at": datetime.now(timezone.utc).isoformat(), "provider": result.provider,
+             "status": result.status, "message": result.message}
+    for key in ("kernel_ref", "dataset_ref", "output_path"):
+        value = getattr(result, key)
+        if value:
+            entry[key] = value
+    return entry
